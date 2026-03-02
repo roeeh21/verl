@@ -367,7 +367,9 @@ class DataParallelPPOActor(BasePPOActor):
                     "position_ids": position_ids,
                 }
 
-                response_start_idx = torch.full((batch_size,), seqlen - response_length - 1, device=input_ids.device)  # (B,)
+                response_start_idx = torch.full(
+                    (batch_size,), seqlen - response_length - 1, device=input_ids.device
+                )  # (B,)
                 response_end_idx = torch.full((batch_size,), seqlen - 1, device=input_ids.device)  # (B,)
 
                 if self.truncate_padding:
@@ -388,21 +390,15 @@ class DataParallelPPOActor(BasePPOActor):
                             model_inputs[key] = torch.gather(t, 1, roll_indices)
                         elif t.dim() == 3:
                             if t.shape[0] == batch_size:  # (B, C, L) — e.g. position_ids after transpose
-                                expanded = roll_indices.unsqueeze(1).expand(
-                                    -1, t.shape[1], -1
-                                )  # (B, C, L)
+                                expanded = roll_indices.unsqueeze(1).expand(-1, t.shape[1], -1)  # (B, C, L)
                                 model_inputs[key] = torch.gather(t, 2, expanded)
                             else:  # (C, B, L) — e.g. qwen2vl mrope position_ids
-                                expanded = roll_indices.unsqueeze(0).expand(
-                                    t.shape[0], -1, -1
-                                )  # (C, B, L)
+                                expanded = roll_indices.unsqueeze(0).expand(t.shape[0], -1, -1)  # (C, B, L)
                                 model_inputs[key] = torch.gather(t, 2, expanded)
                         else:
                             rolled = torch.empty_like(t)
                             for i in range(batch_size):
-                                rolled[i] = torch.roll(
-                                    t[i], -int(left_padding[i]), dims=-1
-                                )
+                                rolled[i] = torch.roll(t[i], -int(left_padding[i]), dims=-1)
                             model_inputs[key] = rolled
 
                     response_start_idx -= left_padding
@@ -410,15 +406,10 @@ class DataParallelPPOActor(BasePPOActor):
 
                     # Trim columns of right padding shared by all sequences
                     mask = model_inputs["attention_mask"]  # (B, L)
-                    last_one_idx = (
-                        mask * torch.arange(seqlen, device=mask.device)
-                    ).max(dim=-1)[0]  # (B,)
+                    last_one_idx = (mask * torch.arange(seqlen, device=mask.device)).max(dim=-1)[0]  # (B,)
                     common_pad_right = (seqlen - 1 - last_one_idx).min().item()
                     if common_pad_right > 0:
-                        model_inputs = {
-                            k: t[..., : seqlen - common_pad_right]
-                            for k, t in model_inputs.items()
-                        }
+                        model_inputs = {k: t[..., : seqlen - common_pad_right] for k, t in model_inputs.items()}
 
                 extra_args = {}
                 if self.use_fused_kernels:
