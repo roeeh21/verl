@@ -1,0 +1,298 @@
+# ai21 kubectl-apply --accelerator-type nvidia-h100-80gb yamls/train_grpo_amalgam_example.yaml --kwargs ssh_key=$(echo ~/.ssh/id_rsa.pub)  (last argument is for debugging, optional)
+
+###############################
+#### BASE MODEL PARAMETERS ####
+###############################
+
+{% set ssh_key_encode = encode_script(ssh_key) if ssh_key else 0 %}
+
+{% set BASE_MODEL_PARAMS = 
+  {
+    'jamba-tiny-dev': {
+      'MODEL_HF_NAME': None,
+      'MODEL_GS_PATH': "gs://ai21-mammoth-storage/models/jamba_hf/tiny_dev",
+      'NODES': 1,
+      'GPUS_PER_NODE': 8,
+      'MICRO_BATCH_SIZE': 1,
+      'QUANTIZATION': "experts_int8",
+      'ENABLE_PREFIX_CACHING': 'False'
+    },
+    'qwen-25-7b-instruct': {
+      'MODEL_HF_NAME': "Qwen/Qwen2.5-7B-Instruct", 
+      'MODEL_GS_PATH': None,
+      'NODES': 1,
+      'GPUS_PER_NODE': 8,
+      'MICRO_BATCH_SIZE': 4,
+      'VLLM_TP_SIZE': 2
+    },
+    'qwen-25-7b': {
+      'MODEL_HF_NAME': "Qwen/Qwen2.5-7B", 
+      'MODEL_GS_PATH': None,
+      'NODES': 1,
+      'GPUS_PER_NODE': 8,
+      'MICRO_BATCH_SIZE': 4,
+      'VLLM_TP_SIZE': 2
+    },
+    'jamba-dense-1206000-instruct-long': {
+      'MODEL_HF_NAME': None,
+      'MODEL_GS_PATH': "gs://ai21-mammoth-storage/models/J3/jamba_3B/hf/cp1206000_instruct_long",
+      'NODES': 4,
+      'GPUS_PER_NODE': 8,
+      'MICRO_BATCH_SIZE': 8,
+      'VLLM_TP_SIZE': 1,
+      'ENABLE_PREFIX_CACHING': 'False'
+    },
+    'jamba-16-mini': {
+      'MODEL_HF_NAME': None,
+      'MODEL_GS_PATH': "gs://ai21-algo-studio-checkpoints/conversions/hf/model_name=rgpt_v2_most_complex_200k_nov_dec_24_v2_fixed_chat_template/checkpoint=650",
+      'NODES': 4,
+      'GPUS_PER_NODE': 8,
+      'MICRO_BATCH_SIZE': 8,
+      'QUANTIZATION': "experts_int8",
+      'ENABLE_PREFIX_CACHING': 'False'
+    },
+    'llama-31-8b-instruct': {
+      'MODEL_HF_NAME': None,
+      'MODEL_GS_PATH': "gs://ai21-algo-studio-research/huggingface_models/meta-llama-meta-llama-31-8b-instruct",
+      'NODES': 2,
+      'GPUS_PER_NODE': 8,
+      'MICRO_BATCH_SIZE': 1,
+      'VLLM_TP_SIZE': 1
+    }
+  } 
+%}
+
+###################################
+### TRAINING PARAMETERS SETTING ###
+###################################
+# if you want to override any default parameters, you can do it here
+
+{% set YOUR_NAME = "TODO" %}
+{% set MODEL_NAME =  "TODO" %} # should be a key in BASE_MODEL_PARAMS
+{% set DATASET_NAME = "TODO" %}
+{% set EXPERIMENT_NAME = "TODO" %}
+{% set REMOTE_SAVE_PATH="gs://ai21-algo-studio-training-outputs/training/models/verl/" + YOUR_NAME + "/" + MODEL_NAME + "/" + DATASET_NAME + "/v2/" + EXPERIMENT_NAME %}
+
+{% set NODES = BASE_MODEL_PARAMS[MODEL_NAME]['NODES'] %}
+{% set GPUS_PER_NODE = BASE_MODEL_PARAMS[MODEL_NAME]['GPUS_PER_NODE'] %}
+{% set VLLM_TP_SIZE = BASE_MODEL_PARAMS[MODEL_NAME]['VLLM_TP_SIZE'] or BASE_MODEL_PARAMS[MODEL_NAME]['GPUS_PER_NODE'] %}
+{% set MICRO_BATCH_SIZE = BASE_MODEL_PARAMS[MODEL_NAME]['MICRO_BATCH_SIZE'] %}
+{% set MODEL_HF_NAME = BASE_MODEL_PARAMS[MODEL_NAME]['MODEL_HF_NAME'] %}
+{% set MODEL_GS_PATH = BASE_MODEL_PARAMS[MODEL_NAME]['MODEL_GS_PATH'] %}
+{% set QUANTIZATION = BASE_MODEL_PARAMS[MODEL_NAME].get('QUANTIZATION', '') %}
+{% set ENABLE_PREFIX_CACHING = BASE_MODEL_PARAMS[MODEL_NAME].get('ENABLE_PREFIX_CACHING', 'True') %}
+
+{% set LR=5e-6 %}
+{% set KL_LOSS_COEF=0.001 %}
+{% set N=8 %}
+
+{% set TRAIN_BATCH_SIZE=32 %}
+{% set PPO_MINI_BATCH_SIZE=32 %}
+{% set VAL_BATCH_SIZE=16 %}
+{% set MAX_PROMPT_LENGTH=2048 %}
+{% set MAX_RESPONSE_LENGTH=4096 %}
+{% set SAVE_FREQ=50 %}
+{% set LOG_FREQ=5 %}
+{% set PROJECT_NAME="verl" %}
+{% set IMAGE_VERSION="main-recent" %}
+{% set GENERATIONS_SAVE_FREQ=50 %}
+{% set PROMPT_KEY='prompt' %}
+{% set RAY_WAIT_REGISTER_TIMEOUT=600 %}
+{% set AI21_EVALUATORS_CONFIG_FILE="TODO FILL OR  REMOVE FROM CMD" %}
+{% set AI21_EVALUATORS_TIMEOUT="TODO FILL OR  REMOVE FROM CMD" %}
+
+# AI21 Evaluators Score Map Configuration
+# These scores are used to map evaluation results to reward scores
+# Customize these values based on your evaluation strategy:
+# - AI21_SCORE_SUCCESS: Score for successful evaluations status
+# - AI21_SCORE_EVALUATION_ERROR: Score for evaluations that fail with evaluation errors
+# - AI21_SCORE_PARSING_ERROR: Score for evaluations that fail with parsing errors  
+# - AI21_SCORE_PARSING_INVALID_OUTPUT: Score for evaluations with invalid output format
+# - AI21_SCORE_BOOLEAN_TRUE: Score for boolean evaluator results that return True (e.g., correct answers)
+# - AI21_SCORE_BOOLEAN_FALSE: Score for boolean evaluator results that return False (e.g., incorrect answers)
+{% set AI21_SCORE_SUCCESS=0.2 %}
+{% set AI21_SCORE_EVALUATION_ERROR=0.0 %}
+{% set AI21_SCORE_PARSING_ERROR=0.0 %}
+{% set AI21_SCORE_PARSING_INVALID_OUTPUT=0.0 %}
+{% set AI21_SCORE_BOOLEAN_TRUE=0.8 %}
+{% set AI21_SCORE_BOOLEAN_FALSE=0.0 %}
+
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: verl-train-grpo-x{{NODES}}-{{hash(REMOTE_SAVE_PATH)}}-t2
+  namespace: default
+  labels:
+    ai21-task: alignment
+spec:
+  backoffLimit: 0
+  {% if NODES > 1 %}
+  completions: {{NODES}}
+  parallelism: {{NODES}}
+  completionMode: Indexed
+  {% endif %}
+  template:
+    spec:
+      containers:
+      - command:
+        - bash
+        - -c
+        - |
+          set -e
+
+          apt-get install -y openssh-server
+          chmod o-r /etc/ssh/sshd_config # to secure secrets, remove read permissions for "others"
+          /etc/init.d/ssh start
+          if [ {{ssh_key_encode}} -ne 0 ]; then
+            mkdir /root/.ssh ; (echo {{ssh_key_encode}} | base64 --decode | gzip -d >> /root/.ssh/authorized_keys)
+          fi
+
+          python3 -m pip install tensorboardX crcmod 
+          
+          {% if MODEL_GS_PATH %}
+          MODEL_PATH=/dev/shm/base_model
+          if [ ! -d "$MODEL_PATH" ]; then
+            mkdir $MODEL_PATH
+          else
+            echo "Directory $MODEL_PATH already exists, skipping mkdir"
+          fi
+          gcloud storage cp {{MODEL_GS_PATH}}/* $MODEL_PATH
+          {%else%}
+          MODEL_PATH={{MODEL_HF_NAME}}
+          {%endif%}
+
+          export HF_HOME=/dev/shm
+
+          mkdir -p ~/.config/vllm && touch ~/.config/vllm/do_not_track
+          
+
+          if [[ "$JOB_COMPLETION_INDEX" == "0" ]] || [ -z $JOB_COMPLETION_INDEX ]; then 
+            tensorboard --logdir=/dev/shm/checkpoints --port=6006 --bind_all &
+
+            RAY_worker_register_timeout_seconds=600 ray start --disable-usage-stats --head --port=6379 --num-gpus={{GPUS_PER_NODE}} --redis-password='' --temp-dir=/persistent/ray-temp --log-style=pretty &
+            
+
+            CMD="python3 -m verl.trainer.main_ppo \
+                algorithm.adv_estimator=grpo \
+                data.train_files=gs://ai21-algo-studio-research/verl_amalgam_experiments/amalgam_function_retrieval.json \
+                data.val_files=gs://ai21-algo-studio-research/verl_amalgam_experiments/amalgam_function_retrieval.json \
+                data.val_datasources_finite=True \
+                data.train_datasources_finite=False \
+                data.train_batch_size={{TRAIN_BATCH_SIZE}} \
+                data.val_batch_size={{VAL_BATCH_SIZE}} \
+                data.max_prompt_length={{MAX_PROMPT_LENGTH}} \
+                data.max_response_length={{MAX_RESPONSE_LENGTH}} \
+                data.prompt_key={{PROMPT_KEY}} \
+                data.return_raw_chat=True \
+                data.truncation=error \
+                data.shuffle=True \
+                data.filter_overlong_prompts=True \
+                data.custom_cls.path=verl/utils/dataset/amalgam_dataset.py \
+                data.custom_cls.name=AmalgamDataset \
+                data.cache_dir=/dev/shm/.gs_cache \
+                actor_rollout_ref.actor.optim.lr={{LR}} \
+                actor_rollout_ref.model.use_remove_padding=False \
+                actor_rollout_ref.actor.ppo_mini_batch_size={{PPO_MINI_BATCH_SIZE}} \
+                actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu={{MICRO_BATCH_SIZE}} \
+                actor_rollout_ref.actor.use_kl_loss=True \
+                actor_rollout_ref.actor.kl_loss_coef={{KL_LOSS_COEF}} \
+                actor_rollout_ref.actor.kl_loss_type=low_var_kl \
+                actor_rollout_ref.model.enable_gradient_checkpointing=True \
+                actor_rollout_ref.actor.fsdp_config.param_offload=True \
+                actor_rollout_ref.actor.fsdp_config.optimizer_offload=True \
+                actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu={{MICRO_BATCH_SIZE}} \
+                actor_rollout_ref.rollout.tensor_model_parallel_size={{VLLM_TP_SIZE}} \
+                actor_rollout_ref.rollout.max_num_batched_tokens={{MAX_PROMPT_LENGTH+MAX_RESPONSE_LENGTH}} \
+                actor_rollout_ref.rollout.name=vllm \
+                actor_rollout_ref.rollout.gpu_memory_utilization=0.3 \
+                actor_rollout_ref.rollout.n={{N}} \
+                actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu={{MICRO_BATCH_SIZE}} \
+                actor_rollout_ref.model.path=\${MODEL_PATH} \
+                actor_rollout_ref.ref.fsdp_config.param_offload=True \
+                actor_rollout_ref.rollout.enforce_eager=False \
+                actor_rollout_ref.rollout.free_cache_engine=False \
+                actor_rollout_ref.rollout.enable_prefix_caching={{ENABLE_PREFIX_CACHING}} \
+                actor_rollout_ref.rollout.val_kwargs.n=16 \
+                reward_model.train_num_examine=0 \
+                reward_model.val_num_examine=1 \
+                reward_model.reward_manager=ai21 \
+                reward_model.ai21_evaluators_config_file={{AI21_EVALUATORS_CONFIG_FILE}} \
+                reward_model.ai21_evaluators_timeout={{AI21_EVALUATORS_TIMEOUT}} \
+                reward_model.ai21_clean_thinking_trace=True \
+                reward_model.ai21_reward_async=True \
+                reward_model.ai21_evaluators_batch_size={{TRAIN_BATCH_SIZE}} \
+                +algorithm.evaluator_weights.exact_match=1.0 \
+                trainer.critic_warmup=0 \
+                trainer.logger=['console','tensorboard'] \
+                trainer.project_name={{PROJECT_NAME}} \
+                trainer.experiment_name={{EXPERIMENT_NAME}} \
+                trainer.n_gpus_per_node={{GPUS_PER_NODE}} \
+                trainer.save_freq={{SAVE_FREQ}} \
+                trainer.test_freq={{SAVE_FREQ}} \
+                trainer.log_freq={{LOG_FREQ}} \
+                trainer.total_epochs=1 \
+                trainer.total_training_steps=5000 \
+                trainer.val_examples_limit=200 \
+                trainer.nnodes={{NODES}} \
+                trainer.remote_save_path={{REMOTE_SAVE_PATH}} \
+                trainer.ray_wait_register_center_timeout={{RAY_WAIT_REGISTER_TIMEOUT}} \
+                trainer.default_local_dir=/dev/shm/checkpoints"
+
+            if [ ! -z "{{QUANTIZATION}}" ]; then
+              CMD="$CMD actor_rollout_ref.rollout.quantization={{QUANTIZATION}}"
+            fi
+
+                # trainer.remote_load_path={{REMOTE_LOAD_PATH}} \
+                # trainer.remote_load_step=100 \
+
+            echo "Running command: $CMD"
+            eval "$CMD"
+            exit_code=$?
+            echo "ray head node exit code: $?"
+            ray stop
+            exit $exit_code
+          else
+            # track https://github.com/ray-project/ray/issues/11841 for why exit status is not 0, even on graceful cluster shutdown
+            set +e
+            RAY_worker_register_timeout_seconds=600 ray start --block --disable-usage-stats --address=${JOB_NAME}-0.${JOB_NAME}:6379 --redis-password=''
+            exit_code=$?
+            echo "ray worker node exit code: $exit_code"
+          fi                    
+          
+        ports:
+          - containerPort: 8265 # ray dashboard
+          - containerPort: 6006 # tensorboard
+        env:
+        - name: HF_HOME
+          value: /dev/shm
+        - name: VERL_SCORE_ONLY_ASSISTANT_RESPONSE
+          value: "1"
+        - name: RAY_worker_register_timeout_seconds
+          value: "600"
+        - name: RAY_timeout_ms
+          value: "100000"
+        - name: RAY_GCS_RPC_SERVER_RECONNECT_TIMEOUT_S
+          value: "60"
+        - name: RAY_heartbeat_timeout_milliseconds
+          value: "30000"
+        - name: AI21_VERL_EVALUATORS_VERBOSE
+          value: False
+        - name: NCCL_DEBUG
+          value: INFO
+        image: us-docker.pkg.dev/publishing-337912/alignment-docker/ai21-verl:{{IMAGE_VERSION}}
+        imagePullPolicy: Always
+        name: main
+        workingDir: /app
+        resources:          
+          requests:            
+            nvidia.com/gpu: "8"
+        volumeMounts:
+        - mountPath: /dev/shm
+          name: dshm
+
+      restartPolicy: OnFailure
+      volumes:
+      - name: dshm
+        emptyDir:
+          medium: Memory
+---

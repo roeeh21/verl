@@ -1,0 +1,75 @@
+# Format checks enforced on CI:
+# 1. Comments must appear above each field.
+# 2. There must be a blank line between each field.
+# 3. Inline comments (after a field on the same line) are not allowed.
+# 4. Indentation level is respected for nested fields.
+
+# defaults specify the default config from each component
+defaults:
+
+  # fsdp optimizer config
+  - ../optim@optim: fsdp
+
+  # fsdp engine config
+  - ../engine@fsdp_config: fsdp
+
+  # dp actor config, inheriting from trainer/config/actor/actor.yaml
+  - actor
+
+  # load the reference default config, then apply the fields in the current yaml
+  - _self_
+
+# Target class for this configuration
+_target_: verl.workers.config.FSDPActorConfig
+
+# TODO(haibin.lin): switch to fsdp2
+strategy: fsdp2
+
+# Gradient clipping for actor updates, specific to the strategy.
+grad_clip: 1.0
+
+# enable router aux loss
+router_aux_loss: False
+
+# router label loss coefficient
+router_lbloss_coef: 0.15
+
+# router z loss alpha
+router_zloss_alpha: 1e-5
+
+# logits z loss alpha
+logits_zloss_alpha: 0.0
+
+# Sequence parallelism size for Ulysses-style model parallelism
+# oc.select: the default val for ref.ulysses_sequence_parallel_size
+ulysses_sequence_parallel_size: 1
+
+# calculate entropy with chunking to reduce memory peak
+entropy_from_logits_with_chunking: False
+
+# recompute entropy
+entropy_checkpointing: False
+
+# Whether to remove padding tokens in inputs during training
+use_remove_padding: ${oc.select:actor_rollout_ref.model.use_remove_padding,false}
+
+# TODO: MG: filter_disagreement_logprobs should be replaced with verl's newer builtin rollout_is_mode=mask
+
+# Whether to move left padding to the right in inputs during training
+move_left_padding_right: ${oc.select:actor_rollout_ref.model.move_left_padding_right,false}
+
+# Whether to minimize padding in inputs during training
+minimize_padding: ${oc.select:actor_rollout_ref.model.minimize_padding,true}
+
+# Filter disagreement logprobs    
+filter_disagreement_logprobs:
+
+  # Enable filter disagreement logprobs
+  enable: False
+
+  # Threshold for filter disagreement logprobs
+  threshold: 1.0
+
+# Mask out clipped responses
+maskout_clipped_responses: False
+

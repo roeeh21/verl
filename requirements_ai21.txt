@@ -1,0 +1,21 @@
+mamba-ssm @ https://github.com/state-spaces/mamba/releases/download/v2.2.5/mamba_ssm-2.2.5+cu12torch2.8cxx11abiFALSE-cp311-cp311-linux_x86_64.whl
+causal-conv1d @ https://github.com/Dao-AILab/causal-conv1d/releases/download/v1.5.4/causal_conv1d-1.5.4+cu12torch2.8cxx11abiFALSE-cp311-cp311-linux_x86_64.whl
+crcmod
+flashinfer_python==0.3.1
+gcsfs==2025.3.0
+tensorboardX
+ai21-evaluators[opik_evals,exact_match_evals,ragas,dashboard,eyeballer,length,language,file_formats,regex_parsers,ifbench,reasoning_gym,openai]==1.89.8
+pydantic==2.11.9 # as pytdantic 2.12.0 introduced a bug which failed ai21-evaluators.
+alignment-core==1.43.1
+ai21-file-utils
+ai21-models-gateway
+pillow>=10.3.0
+prometheus_client
+torchvision==0.23.0
+torchaudio==2.8.0
+fsspec[http]==2025.3.0
+nvidia-ml-py>=12.560.30
+optree>=0.13.0
+pydantic>=2.9
+grpcio>=1.62.1
+filelock==3.20.0

@@ -1,0 +1,3 @@
+# ray start --disable-usage-stats --head --port=6379 --num-gpus=8
+
+sh examples/grpo_trainer/run_deepseek7b_llm.sh critic.ppo_micro_batch_size_per_gpu=0 trainer.nnodes=1 actor_rollout_ref.model.use_remove_padding=False actor_rollout_ref.rollout.gpu_memory_utilization=0.5 actor_rollout_ref.rollout.tensor_model_parallel_size=2 actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=4 actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=4 actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=4 data.train_batch_size=128 actor_rollout_ref.actor.ppo_mini_batch_size=64 actor_rollout_ref.rollout.enforce_eager=False actor_rollout_ref.rollout.free_cache_engine=False 2>&1| tee log.txt

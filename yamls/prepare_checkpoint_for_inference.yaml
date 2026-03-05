@@ -1,0 +1,70 @@
+# ai21 kubectl-apply --accelerator-type nvidia-h100-80gb yamls/prepare_checkpoint_for_inference.yaml --all
+
+
+{% set MODEL_PATH = "gs://ai21-algo-studio-research/noamg/verl/20250302_mix_shuffle" %}
+{% set CHECKPOINTS = [30, 70, 100, 130, 150, 170, 200, 230, 260] %}
+
+{% for cp in CHECKPOINTS %}
+
+{% set cp_path = MODEL_PATH + "/global_step_" + cp|string + "/actor"  %}
+
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: verl-prepare-cp-for-inference-{{hash(MODEL_PATH)}}-{{cp}}
+  namespace: default
+  labels:
+    ai21-task: alignment
+spec:
+  backoffLimit: 0
+  template:
+    spec:
+      containers:
+      - command:
+        - bash
+        - -c
+        - |
+          
+          export MODEL_PATH=/dev/shm/model_workdir
+          mkdir $MODEL_PATH
+          echo "Created dir"
+          sleep 1
+          gsutil -m cp -r "{{cp_path}}/model*" $MODEL_PATH
+          echo "Copied model files"
+          sleep 1
+          gsutil -m cp -r "{{cp_path}}/huggingface" $MODEL_PATH
+          echo "Copied huggingface jsons"
+          sleep 1
+
+          cd /app
+          python scripts/model_merger.py --local_dir $MODEL_PATH
+          echo "Merged model files"
+          sleep 1
+          gsutil -m cp -r $MODEL_PATH/huggingface {{cp_path}}
+          echo "Copied merged model to gs"
+          sleep 1
+          
+        ports:
+          - containerPort: 8888
+        env:
+        - name: HF_HOME
+          value: /dev/shm
+        image: us-docker.pkg.dev/publishing-337912/alignment-docker/ai21-verl:main-recent
+        imagePullPolicy: Always
+        name: main
+        workingDir: /app
+        resources:
+          limits:
+            memory: "800G"
+          requests:
+            memory: "800G"
+        volumeMounts:
+        - mountPath: /dev/shm
+          name: dshm
+      restartPolicy: OnFailure
+      volumes:
+      - name: dshm
+        emptyDir:
+          medium: Memory
+---
+{% endfor %}
