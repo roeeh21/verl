@@ -15,6 +15,7 @@
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
+from tensordict import TensorDict
 
 from verl import DataProto
 from verl.utils.device import get_device_name, get_nccl_backend, get_torch_device
@@ -264,6 +265,72 @@ def test_seqlen_balancing_distributed_params(tmp_path):
         nprocs=world_size,
         join=True,
     )
+
+
+def test_truncate_padding_jagged_matches_dense():
+    """get_truncate_padding_micro_batches_jagged produces the same packing as the dense version."""
+    from verl.utils.seqlen_balancing import (
+        get_truncate_padding_micro_batches,
+        get_truncate_padding_micro_batches_jagged,
+    )
+
+    lengths = [50, 10, 45, 5, 40, 8, 30, 20]
+    max_seq_len = max(lengths)
+    batch_size = len(lengths)
+    max_token_len = 120
+
+    # Build dense batch (left-padded with attention_mask)
+    input_ids_dense = torch.randint(1, 100, (batch_size, max_seq_len))
+    attention_mask = torch.zeros(batch_size, max_seq_len, dtype=torch.long)
+    for i, length in enumerate(lengths):
+        attention_mask[i, max_seq_len - length:] = 1
+    dense_batch = TensorDict({"input_ids": input_ids_dense, "attention_mask": attention_mask}, batch_size=batch_size)
+
+    # Build jagged batch (nested tensors, no padding)
+    jagged_tensors = [torch.randint(1, 100, (length,)) for length in lengths]
+    input_ids_jagged = torch.nested.as_nested_tensor(jagged_tensors, layout=torch.jagged)
+    jagged_batch = TensorDict({"input_ids": input_ids_jagged}, batch_size=batch_size)
+
+    dense_result = get_truncate_padding_micro_batches(
+        batch=dense_batch, max_token_len=max_token_len, same_micro_num_in_dp=False
+    )
+    jagged_result = get_truncate_padding_micro_batches_jagged(
+        batch=jagged_batch, max_token_len=max_token_len, same_micro_num_in_dp=False
+    )
+
+    assert len(dense_result) == len(jagged_result), (
+        f"Different number of micro-batches: dense={len(dense_result)}, jagged={len(jagged_result)}"
+    )
+    for i, (d, j) in enumerate(zip(dense_result, jagged_result)):
+        assert d == j, f"Micro-batch {i} differs: dense={d}, jagged={j}"
+
+
+def test_truncate_padding_jagged_single_sequence():
+    """Single sequence should produce a single micro-batch."""
+    from verl.utils.seqlen_balancing import get_truncate_padding_micro_batches_jagged
+
+    input_ids = torch.nested.as_nested_tensor([torch.randint(1, 100, (42,))], layout=torch.jagged)
+    batch = TensorDict({"input_ids": input_ids}, batch_size=1)
+    result = get_truncate_padding_micro_batches_jagged(batch=batch, max_token_len=100, same_micro_num_in_dp=False)
+    assert len(result) == 1
+    assert result[0] == [0]
+
+
+def test_truncate_padding_jagged_all_same_length():
+    """All same-length sequences should pack maximally."""
+    from verl.utils.seqlen_balancing import get_truncate_padding_micro_batches_jagged
+
+    seq_len = 25
+    num_seqs = 8
+    max_token_len = 100  # fits 4 sequences per micro-batch (4*25=100)
+    jagged_tensors = [torch.randint(1, 100, (seq_len,)) for _ in range(num_seqs)]
+    input_ids = torch.nested.as_nested_tensor(jagged_tensors, layout=torch.jagged)
+    batch = TensorDict({"input_ids": input_ids}, batch_size=num_seqs)
+
+    result = get_truncate_padding_micro_batches_jagged(batch=batch, max_token_len=max_token_len, same_micro_num_in_dp=False)
+    assert len(result) == 2, f"Expected 2 micro-batches, got {len(result)}"
+    all_indices = sorted(idx for mb in result for idx in mb)
+    assert all_indices == list(range(num_seqs))
 
 
 def test_group_balanced_partitions():

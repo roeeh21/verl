@@ -99,6 +99,8 @@ class EngineConfig(BaseConfig):
     use_fused_kernels: bool = False
     # TODO (this may conflict with the one in model config)
     use_remove_padding: bool = True
+    # whether to use truncate_padding for greedy micro-batch packing
+    truncate_padding: bool = False
 
     seed: int = 42
 

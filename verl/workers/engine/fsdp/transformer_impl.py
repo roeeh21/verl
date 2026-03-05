@@ -123,6 +123,11 @@ class FSDPEngine(BaseEngine):
 
         self.use_remove_padding = self.model_config.use_remove_padding
 
+        if self.model_config.truncate_padding and self.use_remove_padding:
+            raise ValueError("Cannot enable both truncate_padding and use_remove_padding")
+        if self.model_config.truncate_padding and self.engine_config.ulysses_sequence_parallel_size > 1:
+            raise ValueError("truncate_padding is not compatible with Ulysses sequence parallelism")
+
         self._init_device_mesh()
 
         if self.engine_config.full_determinism:

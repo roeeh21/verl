@@ -478,6 +478,65 @@ def get_truncate_padding_micro_batches(
     return micro_batches_idx
 
 
+def get_truncate_padding_micro_batches_jagged(
+    batch: TensorDict,
+    max_token_len: int,
+    dp_group: Optional[dist.ProcessGroup] = None,
+    same_micro_num_in_dp: bool = True,
+) -> list[list[int]]:
+    """Create micro-batch index lists that minimize padding for jagged (nested) tensors.
+
+    Same greedy algorithm as get_truncate_padding_micro_batches, but extracts
+    sequence lengths from nested tensor offsets instead of attention_mask.
+
+    Args:
+        batch: TensorDict containing nested "input_ids" with jagged layout.
+        max_token_len: Maximum number of tokens per micro-batch.
+        dp_group: torch.distributed group for data-parallel sync.
+        same_micro_num_in_dp: If True, ensure same micro-batch count across DP ranks.
+
+    Returns:
+        List of index lists, one per micro-batch.
+    """
+    input_ids = batch["input_ids"]
+    assert input_ids.is_nested, "get_truncate_padding_micro_batches_jagged requires nested input_ids"
+    sequence_lengths = input_ids.offsets().diff().cpu().tolist()
+
+    sorted_sequence_lengths_with_idx = sorted(
+        [(length, idx) for idx, length in enumerate(sequence_lengths)], key=lambda x: x[0], reverse=True
+    )
+
+    micro_batches_idx = []
+
+    if not sorted_sequence_lengths_with_idx:
+        if same_micro_num_in_dp:
+            micro_batches_idx = synchronize_micro_batches_num_across_ranks(micro_batches_idx, dp_group)
+        return micro_batches_idx
+
+    longest_sequence_length, longest_sequence_idx = sorted_sequence_lengths_with_idx[0]
+    current_micro_batch_idx = [longest_sequence_idx]
+    current_micro_batch_max_len = longest_sequence_length
+
+    for sequence_length, idx in sorted_sequence_lengths_with_idx[1:]:
+        new_micro_batch_size = len(current_micro_batch_idx) + 1
+        new_total_tokens = new_micro_batch_size * current_micro_batch_max_len
+
+        if new_total_tokens <= max_token_len:
+            current_micro_batch_idx.append(idx)
+        else:
+            micro_batches_idx.append(current_micro_batch_idx)
+            current_micro_batch_idx = [idx]
+            current_micro_batch_max_len = sequence_length
+
+    if current_micro_batch_idx:
+        micro_batches_idx.append(current_micro_batch_idx)
+
+    if same_micro_num_in_dp:
+        micro_batches_idx = synchronize_micro_batches_num_across_ranks(micro_batches_idx, dp_group)
+
+    return micro_batches_idx
+
+
 def get_max_sequence_length_padding_micro_batches(
     batch: TensorDict,
     max_token_len: int,
