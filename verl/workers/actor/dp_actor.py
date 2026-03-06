@@ -161,7 +161,7 @@ class DataParallelPPOActor(BasePPOActor):
         self.minimize_padding = self.config.minimize_padding
         self.truncate_padding = self.config.truncate_padding
 
-        if self.minimize_padding:
+        if self.minimize_padding or self.truncate_padding:
             self.move_left_padding_right = True
 
         if self.truncate_padding and self.use_remove_padding:
@@ -450,7 +450,7 @@ class DataParallelPPOActor(BasePPOActor):
                     response_start_idx = response_start_idx - left_padding_lengths
                     response_end_idx = response_end_idx - left_padding_lengths
 
-                if self.minimize_padding:
+                if self.minimize_padding or self.truncate_padding:
                     common_padding_left = model_inputs["attention_mask"].argmax(dim=1).min().item()
                     common_padding_right = model_inputs["attention_mask"].flip(dims=[1]).argmax(dim=1).min().item()
                     model_inputs = {
