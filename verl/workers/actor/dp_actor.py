@@ -186,6 +186,8 @@ class DataParallelPPOActor(BasePPOActor):
             print(f"{role} use_remove_padding={self.use_remove_padding}")
             print(f"{role} move_left_padding_right={self.move_left_padding_right}")
             print(f"{role} minimize_padding={self.minimize_padding}")
+            print(f"{role} truncate_padding={self.truncate_padding}")
+            print(f"{role} padding_mode={self.padding_mode}")
         self.use_fused_kernels = self.config.get("use_fused_kernels", False)
         if torch.distributed.get_rank() == 0:
             print(f"{role} use_fused_kernels={self.use_fused_kernels}")
