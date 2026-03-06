@@ -45,6 +45,9 @@ move_left_padding_right: false
 # Whether to minimize padding in inputs during training
 minimize_padding: true
 
+# Whether to use greedy length-based micro-batch packing to reduce padding waste
+truncate_padding: false
+
 # Set to positive value to enable LoRA (e.g., 32)
 lora_rank: 0
 

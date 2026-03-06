@@ -61,6 +61,9 @@ move_left_padding_right: ${oc.select:actor_rollout_ref.model.move_left_padding_r
 # Whether to minimize padding in inputs during training
 minimize_padding: ${oc.select:actor_rollout_ref.model.minimize_padding,true}
 
+# Whether to use greedy length-based micro-batch packing to reduce padding waste
+truncate_padding: ${oc.select:actor_rollout_ref.model.truncate_padding,false}
+
 # Filter disagreement logprobs    
 filter_disagreement_logprobs:
 
