@@ -372,6 +372,64 @@ def get_minimize_padding_micro_batches(
     return micro_batches_idx
 
 
+def get_truncate_padding_micro_batches(
+    batch: TensorDict,
+    max_token_len: int,
+    dp_group: Optional[dist.ProcessGroup] = None,
+    same_micro_num_in_dp: bool = True,
+) -> list[list[int]]:
+    """Create micro-batch index lists that minimize padding for dense (padded) tensors.
+
+    Greedy algorithm: sort sequences by length descending, then pack into micro-batches
+    where (batch_size * max_len_in_batch) <= max_token_len.
+
+    Args:
+        batch: TensorDict containing "attention_mask" with shape [B, S].
+        max_token_len: Maximum number of tokens per micro-batch.
+        dp_group: torch.distributed group for data-parallel sync.
+        same_micro_num_in_dp: If True, ensure same micro-batch count across DP ranks.
+
+    Returns:
+        List of index lists, one per micro-batch.
+    """
+    attention_mask = batch["attention_mask"]
+    sequence_lengths = attention_mask.sum(dim=1).cpu().tolist()
+
+    sorted_sequence_lengths_with_idx = sorted(
+        [(length, idx) for idx, length in enumerate(sequence_lengths)], key=lambda x: x[0], reverse=True
+    )
+
+    micro_batches_idx = []
+
+    if not sorted_sequence_lengths_with_idx:
+        if same_micro_num_in_dp:
+            micro_batches_idx = synchronize_micro_batches_num_across_ranks(micro_batches_idx, dp_group)
+        return micro_batches_idx
+
+    longest_sequence_length, longest_sequence_idx = sorted_sequence_lengths_with_idx[0]
+    current_micro_batch_idx = [longest_sequence_idx]
+    current_micro_batch_max_len = longest_sequence_length
+
+    for sequence_length, idx in sorted_sequence_lengths_with_idx[1:]:
+        new_micro_batch_size = len(current_micro_batch_idx) + 1
+        new_total_tokens = new_micro_batch_size * current_micro_batch_max_len
+
+        if new_total_tokens <= max_token_len:
+            current_micro_batch_idx.append(idx)
+        else:
+            micro_batches_idx.append(current_micro_batch_idx)
+            current_micro_batch_idx = [idx]
+            current_micro_batch_max_len = sequence_length
+
+    if current_micro_batch_idx:
+        micro_batches_idx.append(current_micro_batch_idx)
+
+    if same_micro_num_in_dp:
+        micro_batches_idx = synchronize_micro_batches_num_across_ranks(micro_batches_idx, dp_group)
+
+    return micro_batches_idx
+
+
 def get_truncate_padding_micro_batches_jagged(
     batch: TensorDict,
     max_token_len: int,
@@ -468,6 +526,7 @@ class PaddingMode(Enum):
     MAX_SEQUENCE_LENGTH_PADDING = auto()
     REMOVE_PADDING = auto()
     MINIMIZE_PADDING = auto()
+    TRUNCATE_PADDING = auto()
 
 
 def rearrange_micro_batches(
@@ -596,7 +655,14 @@ def prepare_dynamic_batch(
         f"Got {max_token_len=} and {max_seq_len=}."
     )
 
-    if padding_mode == PaddingMode.MINIMIZE_PADDING:
+    if padding_mode == PaddingMode.TRUNCATE_PADDING:
+        micro_batches_idx = get_truncate_padding_micro_batches(
+            batch=data.batch,
+            max_token_len=max_token_len,
+            dp_group=dp_group,
+            same_micro_num_in_dp=same_micro_num_in_dp,
+        )
+    elif padding_mode == PaddingMode.MINIMIZE_PADDING:
         micro_batches_idx = get_minimize_padding_micro_batches(
             batch=data.batch,
             max_token_len=max_token_len,

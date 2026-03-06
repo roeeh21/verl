@@ -159,9 +159,13 @@ class DataParallelPPOActor(BasePPOActor):
         self.use_remove_padding = self.config.use_remove_padding
         self.move_left_padding_right = self.config.move_left_padding_right
         self.minimize_padding = self.config.minimize_padding
+        self.truncate_padding = self.config.truncate_padding
 
         if self.minimize_padding:
             self.move_left_padding_right = True
+
+        if self.truncate_padding and self.use_remove_padding:
+            raise ValueError("Cannot enable both truncate_padding and use_remove_padding")
 
         if self.use_remove_padding and (self.minimize_padding or self.move_left_padding_right):
             raise ValueError(
@@ -169,7 +173,9 @@ class DataParallelPPOActor(BasePPOActor):
                 "enabling either one of minimize_padding or move_left_padding_right will have no effect."
             )
 
-        if self.use_remove_padding:
+        if self.truncate_padding:
+            self.padding_mode = PaddingMode.TRUNCATE_PADDING
+        elif self.use_remove_padding:
             self.padding_mode = PaddingMode.REMOVE_PADDING
         elif self.minimize_padding:
             self.padding_mode = PaddingMode.MINIMIZE_PADDING

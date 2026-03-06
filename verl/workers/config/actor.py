@@ -249,6 +249,7 @@ class FSDPActorConfig(ActorConfig):
     use_remove_padding: bool = False
     move_left_padding_right: bool = False
     minimize_padding: bool = True
+    truncate_padding: bool = False
     profiler: ProfilerConfig = field(default_factory=ProfilerConfig)
     use_rollout_log_probs: bool = False
 
