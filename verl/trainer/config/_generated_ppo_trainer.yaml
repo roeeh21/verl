@@ -153,6 +153,8 @@ actor_rollout_ref:
     entropy_from_logits_with_chunking: false
     entropy_checkpointing: false
     use_remove_padding: ${oc.select:actor_rollout_ref.model.use_remove_padding,false}
+    truncate_padding: ${oc.select:actor_rollout_ref.model.truncate_padding,false}
+    sum_pi_squared_checkpointing: false
   ref:
     rollout_n: ${oc.select:actor_rollout_ref.rollout.n,1}
     strategy: ${actor_rollout_ref.actor.strategy}
@@ -382,6 +384,7 @@ actor_rollout_ref:
     enable_gradient_checkpointing: true
     enable_activation_offload: false
     use_remove_padding: true
+    truncate_padding: false
     lora_rank: 0
     lora_alpha: 16
     target_modules: all-linear
@@ -594,6 +597,7 @@ critic:
     enable_gradient_checkpointing: true
     enable_activation_offload: false
     use_remove_padding: true
+    truncate_padding: false
     lora_rank: 0
     lora_alpha: 16
     target_modules: all-linear

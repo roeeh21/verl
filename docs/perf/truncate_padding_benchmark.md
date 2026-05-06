@@ -1,5 +1,7 @@
 # Truncate padding benchmark (Qwen 2.5 7B + GSM8K)
 
+Last updated: 05/06/2026
+
 Short benchmark comparing **full padding**, **truncate_padding**, and **remove_padding** on the same setup to quantify speedup and memory reduction.
 
 ## Setup
