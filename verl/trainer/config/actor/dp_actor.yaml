@@ -42,3 +42,6 @@ entropy_checkpointing: False
 # Whether to remove padding tokens in inputs during training
 use_remove_padding: ${oc.select:actor_rollout_ref.model.use_remove_padding,false}
 
+# Whether to use length-grouped micro-batches to reduce per-micro-batch padding
+# (used when use_remove_padding cannot be enabled, e.g. Mamba/SSM models)
+use_length_grouped_bsz: ${oc.select:actor_rollout_ref.model.use_length_grouped_bsz,false}

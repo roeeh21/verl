@@ -15,8 +15,10 @@
 import copy
 import heapq
 from itertools import chain
+from typing import Optional
 
 import torch
+from tensordict import TensorDict
 from torch import distributed as dist
 
 from verl.protocol import DataProto
@@ -345,6 +347,56 @@ def roundup_divisible(a: int, b: int) -> int:
     return ((a + b - 1) // b) * b
 
 
+def synchronize_micro_batches_num_across_ranks(
+    micro_batches_idx: list[list[int]],
+    dp_group: Optional[dist.ProcessGroup] = None,
+) -> list[list[int]]:
+    """Ensure all ranks have the same number of micro-batches by splitting larger batches.
+
+    When using dynamic micro-batching, different DP ranks may end up with different
+    numbers of micro-batches due to varying sequence length distributions. This function
+    synchronizes the count by splitting the largest micro-batches on ranks that have fewer.
+
+    Args:
+        micro_batches_idx: List of index lists for micro-batches.
+        dp_group: The distributed group for data-parallel sync.
+
+    Returns:
+        List of index lists with the same count across all ranks.
+    """
+    if not dist.is_initialized():
+        return micro_batches_idx
+
+    num_micro_batches = len(micro_batches_idx)
+    num_micro_batches_tensor = torch.tensor([num_micro_batches], device=get_device_name())
+    dist.all_reduce(num_micro_batches_tensor, op=dist.ReduceOp.MAX, group=dp_group)
+    max_num_micro_batches = num_micro_batches_tensor.cpu().item()
+
+    if not micro_batches_idx and max_num_micro_batches > 0:
+        rank = dist.get_rank(dp_group)
+        raise RuntimeError(
+            f"Cannot create {max_num_micro_batches} micro-batches from an empty batch on rank {rank}. "
+            "All ranks in a DP group must have a non-empty batch if any rank does."
+        )
+
+    while len(micro_batches_idx) < max_num_micro_batches:
+        largest_batch_idx = max(range(len(micro_batches_idx)), key=lambda i: len(micro_batches_idx[i]))
+        largest_batch = micro_batches_idx[largest_batch_idx]
+        if len(largest_batch) <= 1:
+            num_sequences = sum(len(batch) for batch in micro_batches_idx)
+            rank = dist.get_rank(dp_group)
+            raise RuntimeError(
+                f"Cannot split micro-batches further without creating empty batches. "
+                f"Need {max_num_micro_batches} micro-batches but only have {num_sequences} "
+                f"sequences in rank {rank}. Total batch size should be equal across ranks."
+            )
+        mid = len(largest_batch) // 2
+        micro_batches_idx[largest_batch_idx] = largest_batch[:mid]
+        micro_batches_idx.append(largest_batch[mid:])
+
+    return micro_batches_idx
+
+
 def rearrange_micro_batches(
     batch,
     max_token_len,
@@ -549,6 +601,63 @@ def restore_dynamic_batch(data: torch.Tensor, batch_idx_list: list[list[int]]) -
         reverted_data = data[revert_indices]
 
     return reverted_data
+
+
+def get_length_grouped_micro_batches(
+    batch: TensorDict,
+    max_token_len: int,
+    dp_group: Optional[dist.ProcessGroup] = None,
+    same_micro_num_in_dp: bool = True,
+) -> list[list[int]]:
+    """Create micro-batch index lists that group sequences by length to minimize padding.
+
+    Greedy algorithm: sort sequences by length (descending) and pack into micro-batches
+    such that ``len(micro_batch) * max_seq_in_micro_batch <= max_token_len``. When the
+    micro-batch is later re-padded to dense form (``torch.nested.to_padded_tensor``)
+    for the model forward, padding waste is bounded by this cap.
+
+    Used when ``use_remove_padding`` (sequence packing) is unavailable, e.g. for
+    Mamba/SSM-based models.
+
+    Args:
+        batch: TensorDict containing nested ``input_ids`` with jagged layout.
+        max_token_len: Maximum number of tokens per micro-batch (after padding).
+        dp_group: torch.distributed group for data-parallel sync.
+        same_micro_num_in_dp: If True, ensure same micro-batch count across DP ranks.
+
+    Returns:
+        List of index lists, one per micro-batch.
+    """
+    input_ids = batch["input_ids"]
+    assert input_ids.is_nested, "get_length_grouped_micro_batches requires nested input_ids"
+    sequence_lengths = input_ids.offsets().diff().cpu().tolist()
+
+    sorted_sequence_lengths_with_idx = sorted(
+        [(length, idx) for idx, length in enumerate(sequence_lengths)], key=lambda x: x[0], reverse=True
+    )
+
+    micro_batches_idx = []
+    current_micro_batch = []
+    current_max_len = 0
+
+    for length, idx in sorted_sequence_lengths_with_idx:
+        new_max_len = max(current_max_len, length)
+        new_batch_size = len(current_micro_batch) + 1
+        if current_micro_batch and new_batch_size * new_max_len > max_token_len:
+            micro_batches_idx.append(current_micro_batch)
+            current_micro_batch = [idx]
+            current_max_len = length
+        else:
+            current_micro_batch.append(idx)
+            current_max_len = new_max_len
+
+    if current_micro_batch:
+        micro_batches_idx.append(current_micro_batch)
+
+    if same_micro_num_in_dp:
+        micro_batches_idx = synchronize_micro_batches_num_across_ranks(micro_batches_idx, dp_group=dp_group)
+
+    return micro_batches_idx
 
 
 def get_group_balanced_partitions(

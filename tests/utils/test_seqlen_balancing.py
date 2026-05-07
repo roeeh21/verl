@@ -276,3 +276,61 @@ def test_group_balanced_partitions_equal_size():
         for uid in uids_in_partition:
             uid_indices = [i for i, u in enumerate(uid_list) if u == uid]
             assert all(i in partition for i in uid_indices)
+
+
+def test_length_grouped_micro_batches_respects_token_budget():
+    """get_length_grouped_micro_batches packs sequences such that
+    len(micro_batch) * max_seq_in_batch <= max_token_len, and covers every input."""
+    from tensordict import TensorDict
+
+    from verl.utils.seqlen_balancing import get_length_grouped_micro_batches
+
+    lengths = [50, 10, 45, 5, 40, 8, 30, 20]
+    max_token_len = 120
+
+    nested_ids = torch.nested.nested_tensor(
+        [torch.randint(1, 100, (length,)) for length in lengths], layout=torch.jagged
+    )
+    batch = TensorDict({"input_ids": nested_ids}, batch_size=[len(lengths)])
+
+    partitions = get_length_grouped_micro_batches(batch, max_token_len)
+
+    for partition in partitions:
+        max_len = max(lengths[i] for i in partition)
+        assert len(partition) * max_len <= max_token_len
+
+    all_indices = sorted(idx for part in partitions for idx in part)
+    assert all_indices == list(range(len(lengths)))
+
+
+def test_length_grouped_micro_batches_single_sequence():
+    """Single-sequence input forms one micro-batch with that index."""
+    from tensordict import TensorDict
+
+    from verl.utils.seqlen_balancing import get_length_grouped_micro_batches
+
+    nested_ids = torch.nested.nested_tensor([torch.randint(1, 100, (42,))], layout=torch.jagged)
+    batch = TensorDict({"input_ids": nested_ids}, batch_size=[1])
+
+    partitions = get_length_grouped_micro_batches(batch, max_token_len=100)
+    assert len(partitions) == 1
+    assert partitions[0] == [0]
+
+
+def test_length_grouped_micro_batches_all_same_length():
+    """Equal-length sequences pack to the full per-batch capacity."""
+    from tensordict import TensorDict
+
+    from verl.utils.seqlen_balancing import get_length_grouped_micro_batches
+
+    n = 8
+    seq_len = 10
+    max_token_len = 40  # fits 4 sequences per micro-batch
+
+    nested_ids = torch.nested.nested_tensor([torch.randint(1, 100, (seq_len,)) for _ in range(n)], layout=torch.jagged)
+    batch = TensorDict({"input_ids": nested_ids}, batch_size=[n])
+
+    partitions = get_length_grouped_micro_batches(batch, max_token_len)
+    assert len(partitions) == 2  # 8 sequences / 4 per batch = 2
+    for partition in partitions:
+        assert len(partition) == 4
