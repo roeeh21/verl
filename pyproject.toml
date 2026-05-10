@@ -110,5 +110,4 @@ verl = [
   "version/*",
   "trainer/config/*.yaml",
   "trainer/config/*/*.yaml",
-  "experimental/*/config/*.yaml",
 ]

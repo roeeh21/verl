@@ -1,0 +1,337 @@
+steps:
+- id: sonarqube-scan
+  name: 'us-docker.pkg.dev/${PROJECT_ID}/infra-docker/sonar-scanner'
+  waitFor: ['-']
+  entrypoint: 'bash'
+  args:
+  - '-c'
+  - 'if [ $BRANCH_NAME == "master" ] || [ $BRANCH_NAME == "prod" ]; then sonar-scanner -Dsonar.host.url=http://sonarqube.publishing-testing.ai21.com/sonarqube/ -Dsonar.projectKey=$_GIT_REPO -Dsonar.sources=. -Dsonar.qualitygate.wait=true; fi'
+
+- id: pre-pull-buildkit
+  name: gcr.io/cloud-builders/docker
+  waitFor: ['-']
+  entrypoint: bash
+  args:
+    - -lc
+    - docker pull moby/buildkit:buildx-stable-1
+
+# run pre-commit hooks in CI and fail if changes are needed
+- id: pre-commit-verify
+  name: 'python:3.11-slim'
+  waitFor: ['-']
+  entrypoint: 'bash'
+  args:
+  - '-lc'
+  - |
+    set -eu -o pipefail
+    python -m pip install --upgrade pip
+    pip install -r requirements-precommit.txt
+    apt-get update && apt-get install -y --no-install-recommends git && rm -rf /var/lib/apt/lists/*
+    pre-commit run --all-files --show-diff-on-failure --color=always
+    PYTHONWARNINGS=error python3 -m compileall -q .
+
+- id: fetch-code
+  name: us-docker.pkg.dev/${PROJECT_ID}/infra-docker/ai21-repo-utils/ci-git
+  waitFor: ['-']
+  env:
+  - 'GIT_REPO=${_GIT_REPO}'
+  secretEnv: ['READ_ACCESS_TOKEN']
+  args: ['git fetch --unshallow --tags']
+
+- id: setup-ssh-access
+  name: us-docker.pkg.dev/${PROJECT_ID}/infra-docker/ai21-repo-utils/ci-git
+  waitFor: ['-']
+  secretEnv: ['BITBUCKET_SSH_KEY']
+  entrypoint: 'bash'
+  args:
+  - '-c'
+  - |
+    mkdir -p -m 0700 .ssh && \
+    echo "$${BITBUCKET_SSH_KEY}" > .ssh/id_rsa && \
+    chmod 600 .ssh/id_rsa
+
+# TODO: TAMER: Do we need compile here?
+
+# find out git tag and derive image refs
+- id: set-build-vars
+  name: us-docker.pkg.dev/${PROJECT_ID}/infra-docker/ai21-repo-utils/ci-git
+  waitFor: ['fetch-code']
+  entrypoint: 'bash'
+  args:
+  - '-c'
+  - |
+    set -eu -o pipefail;
+    export build_git_tag="$(git tag -l --points-at HEAD | head -n 1)";
+    export PRETEST_IMAGE="${_AR_DOCKER_REPO}/${_GIT_REPO}:${_DOCKER_BRANCH_NAME}-${SHORT_SHA}-pretest";
+    export RECENT_IMAGE="${_AR_DOCKER_REPO}/${_GIT_REPO}:${_DOCKER_BRANCH_NAME}-recent";
+    export FINAL_IMAGE="${_AR_DOCKER_REPO}/${_GIT_REPO}:${_DOCKER_BRANCH_NAME}-${SHORT_SHA}";
+    ( env | grep -E '^(build_|FINAL_|RECENT_|PRETEST_)' > cloudbuild.vars );
+    echo "COMMIT_AUTHOR=$$(git log -1 --format=%ae | cut -d@ -f1)" >> cloudbuild.vars
+    COMMIT_MSG="$$(git log -1 --format=%s)"
+    if echo "$$COMMIT_MSG" | grep -q '\[run-regression\]'; then
+      echo "RUN_REGRESSION=1" >> cloudbuild.vars
+    else
+      echo "RUN_REGRESSION=0" >> cloudbuild.vars
+    fi
+    cat cloudbuild.vars;
+
+- id: clone-submodules
+  name: us-docker.pkg.dev/${PROJECT_ID}/infra-docker/ai21-repo-utils/ci-git
+  waitFor: ['setup-ssh-access']
+  env:
+  - 'GIT_REPO=${_GIT_REPO}'
+  secretEnv: ['READ_ACCESS_TOKEN']
+  entrypoint: 'bash'
+  args:
+  - '-c'
+  - |
+    git submodule update --init --recursive
+
+- id: deps-key-and-cache-hit
+  name: gcr.io/cloud-builders/docker
+  waitFor: ['set-build-vars']
+  entrypoint: bash
+  args:
+  - -lc
+  - |
+    set -eu -o pipefail
+    . /workspace/cloudbuild.vars
+
+    # We want code-only changes to skip rebuilding deps. To do that we:
+    # - Derive the dependency inputs from the Dockerfile (deps stage COPY sources).
+    # - Hash those inputs + Dockerfile + base image digest to get a stable DEPS_KEY.
+    # - Use that key to check whether the deps image already exists in the registry.
+
+    base_ref="$(awk '$1 == "FROM" { print $2; exit }' Dockerfile)"
+    base_digest="$(docker buildx imagetools inspect --format "{{.Digest}}" "$base_ref" 2>/dev/null || true)"
+
+    # Extract all shell-form COPY sources inside the `deps` stage.
+    # Notes:
+    # - JSON-array COPY is intentionally rejected (harder to parse safely).
+    # - Multi-line COPY (ending with '\') is intentionally rejected for clarity.
+    deps_inputs="$(
+      awk '
+        BEGIN { in_deps = 0 }
+        /^[ \t]*FROM[ \t]+/ {
+          if ($0 ~ /(^|[[:space:]])AS[[:space:]]+deps([[:space:]]|$)/) { in_deps = 1; next }
+          if (in_deps) { exit }
+        }
+        in_deps && /^[ \t]*COPY[ \t]+/ {
+          if ($0 ~ /^[ \t]*COPY[ \t]*\[/) { print "__ERR_JSON_COPY__"; exit }
+          if ($0 ~ /\\[ \t]*$/) { print "__ERR_MULTILINE_COPY__"; exit }
+          for (i = 2; i <= NF - 1; i++) {
+            if ($i ~ /^--/) { continue }
+            print $i
+          }
+        }
+      ' Dockerfile | sort -u
+    )"
+
+    if echo "$deps_inputs" | grep -qx '__ERR_JSON_COPY__'; then
+      echo "ERROR: Dockerfile uses JSON-array COPY syntax in the deps stage; use shell-form COPY." >&2
+      exit 1
+    fi
+    if echo "$deps_inputs" | grep -qx '__ERR_MULTILINE_COPY__'; then
+      echo "ERROR: Dockerfile uses multi-line COPY (with '\\') in the deps stage; keep COPY on one line." >&2
+      exit 1
+    fi
+    if [ -z "$deps_inputs" ]; then
+      echo "ERROR: failed to find any COPY instructions in the deps stage; cannot compute deps key." >&2
+      exit 1
+    fi
+
+    DEPS_KEY="$(
+      (
+        printf 'BASE_REF=%s\n' "$base_ref"
+        printf 'BASE_DIGEST=%s\n' "$base_digest"
+        sha256sum Dockerfile
+        for f in $deps_inputs; do
+          if [ -e "$f" ]; then
+            sha256sum "$f"
+          else
+            echo "ERROR: deps-key input '$f' not found in build context." >&2
+            exit 1
+          fi
+        done
+      ) | sha256sum | cut -c1-12
+    )"
+
+    # Escape bash vars with $$ so Cloud Build doesn't treat them as substitutions.
+    DEPS_IMAGE="${_AR_DOCKER_REPO}/${_GIT_REPO}:deps-$$DEPS_KEY"
+
+    echo "DEPS_KEY=$$DEPS_KEY" >> /workspace/cloudbuild.vars
+    echo "DEPS_IMAGE=$$DEPS_IMAGE" >> /workspace/cloudbuild.vars
+
+    if docker buildx imagetools inspect "$$DEPS_IMAGE" >/dev/null 2>&1; then
+      echo "DEPS_IMAGE_EXISTS=1" >> /workspace/cloudbuild.vars
+    else
+      echo "DEPS_IMAGE_EXISTS=0" >> /workspace/cloudbuild.vars
+    fi
+
+    cat /workspace/cloudbuild.vars
+
+- id: build-deps-image
+  name: gcr.io/cloud-builders/docker
+  waitFor: ['deps-key-and-cache-hit', 'setup-ssh-access', 'clone-submodules', 'pre-pull-buildkit']
+  entrypoint: bash
+  env:
+    - DOCKER_BUILDKIT=1
+  args:
+    - -lc
+    - |
+      set -euxo pipefail
+      . /workspace/cloudbuild.vars
+      if [ "$${DEPS_IMAGE_EXISTS:-0}" = "1" ]; then
+        echo "Deps image already exists ($${DEPS_IMAGE}); skipping deps build."
+        exit 0
+      fi
+      docker buildx create \
+        --name builder \
+        --driver docker-container \
+        --driver-opt network=cloudbuild \
+        --driver-opt image=moby/buildkit:buildx-stable-1 \
+        --use 2>/dev/null || true
+      docker buildx build \
+        --progress=plain \
+        --secret id=key,src=.ssh/id_rsa \
+        --add-host=metadata.google.internal:169.254.169.254 \
+        --cache-from=type=registry,ref=${_AR_DOCKER_REPO}/${_GIT_REPO}:cache \
+        --cache-to=type=registry,ref=${_AR_DOCKER_REPO}/${_GIT_REPO}:cache,mode=max \
+        --target deps \
+        -t "$${DEPS_IMAGE}" \
+        --push \
+        .
+
+- id: create-code-tar
+  name: gcr.io/cloud-builders/git
+  waitFor: ['clone-submodules']
+  entrypoint: bash
+  args:
+    - -lc
+    - |
+      set -euxo pipefail
+      git checkout -f "${SHORT_SHA}" || true
+      {
+        git ls-files -z --cached --recurse-submodules; \
+        git ls-files -z --others --exclude-standard; \
+      } | tar --null -T - -cf /workspace/app.tar --transform 's|^|app/|'
+
+- id: build-app-image
+  name: gcr.io/go-containerregistry/crane:debug
+  waitFor: ['build-deps-image', 'create-code-tar']
+  entrypoint: sh
+  args:
+    - -lc
+    - |
+      set -eu
+      . /workspace/cloudbuild.vars
+
+      crane append --base "$${DEPS_IMAGE}" --new_layer /workspace/app.tar --new_tag "$${PRETEST_IMAGE}"
+      crane mutate \
+        --env PYTHONPATH="/app" \
+        --env BRANCH_NAME="${BRANCH_NAME}" \
+        --env GCP_IMAGE="$${PRETEST_IMAGE}" \
+        --env GIT_COMMIT="${SHORT_SHA}" \
+        "$${PRETEST_IMAGE}"
+
+- id: run-tests
+  name: gcr.io/cloud-builders/docker
+  waitFor: ['build-app-image']
+  entrypoint: bash
+  args:
+    - -lc
+    - |
+      set -eu -o pipefail
+      . /workspace/cloudbuild.vars
+      docker image inspect "$${PRETEST_IMAGE}" >/dev/null 2>&1 || docker pull "$${PRETEST_IMAGE}"
+      docker run --rm \
+        --add-host=metadata.google.internal:169.254.169.254 \
+        --network=cloudbuild \
+        -e GOOGLE_CLOUD_PROJECT="${PROJECT_ID}" \
+        -e CLOUDSDK_CORE_PROJECT="${PROJECT_ID}" \
+        -e GCE_METADATA_HOST=169.254.169.254 \
+        -w /app \
+        --entrypoint bash \
+        "$${PRETEST_IMAGE}" \
+        -lc "scripts/ai21/run_ai21_unit_tests.sh"
+
+- id: publish-final-images
+  name: gcr.io/cloud-builders/docker
+  waitFor: ['run-tests', 'pre-commit-verify', 'sonarqube-scan']
+  entrypoint: bash
+  args:
+    - -lc
+    - |
+      set -eu -o pipefail
+      . /workspace/cloudbuild.vars
+      docker image inspect "$${PRETEST_IMAGE}" >/dev/null 2>&1 || docker pull "$${PRETEST_IMAGE}"
+      docker tag "$${PRETEST_IMAGE}" "$${FINAL_IMAGE}"
+      docker tag "$${PRETEST_IMAGE}" "$${RECENT_IMAGE}"
+
+- id: publish-git-tag
+  name: gcr.io/go-containerregistry/crane:debug
+  waitFor: ['run-tests', 'pre-commit-verify', 'sonarqube-scan']
+  entrypoint: sh
+  args:
+    - -lc
+    - |
+      set -eu
+      . /workspace/cloudbuild.vars
+      if [ -n "$${build_git_tag}" ]; then
+        crane tag "$${PRETEST_IMAGE}" "$${build_git_tag}"
+      fi
+
+- id: run-regression-tests
+  name: us-docker.pkg.dev/${PROJECT_ID}/studio-docker/training-hera-workflows:master-recent
+  entrypoint: bash
+  allowFailure: true
+  env:
+    - "AI21_HERA_DISABLE_AUTO_INIT=true"
+    - 'SLACK_CHANNEL=#training-regressions'
+    - "REGRESSION_IMAGE_VERSION=${_DOCKER_BRANCH_NAME}-${SHORT_SHA}"
+  waitFor:
+    - "publish-final-images"
+    - "publish-git-tag"
+  args:
+    - -lc
+    - |
+      set -eu -o pipefail
+      . /workspace/cloudbuild.vars
+
+      REGRESSION_TESTS="regression_v2_det_4gpu"
+
+      if [ "$BRANCH_NAME" != "main" ] && [ "$${RUN_REGRESSION:-0}" != "1" ]; then
+        echo "Skipping regression (branch=$BRANCH_NAME, no [run-regression] flag in commit)."
+        exit 0
+      fi
+
+      gcloud container clusters get-credentials main --project=algo-platform-ai21 --zone=us-central1
+
+      IFS=',' read -ra TESTS <<< "$$REGRESSION_TESTS"
+      for test in "$${TESTS[@]}"; do
+        test="$$(echo "$$test" | xargs)"
+
+        echo "Generating regression workflow for $$test..."
+        regression "$$test" --cluster-id gke_algo-platform-ai21_us-central1_main --user "$${COMMIT_AUTHOR}" --dry-run | sed -n '/^apiVersion:/,$$p' > "/workspace/regression-workflow-$${test}.yaml"
+
+        echo "Submitting regression workflow for $$test..."
+        kubectl create -n default -f "/workspace/regression-workflow-$${test}.yaml"
+      done
+
+substitutions:
+  _DOCKER_BRANCH_NAME: ${BRANCH_NAME//\//-}
+
+images: ['$_AR_DOCKER_REPO/$_GIT_REPO:$_DOCKER_BRANCH_NAME-$SHORT_SHA', '$_AR_DOCKER_REPO/$_GIT_REPO:$_DOCKER_BRANCH_NAME-recent']
+
+availableSecrets:
+  secretManager:
+  - versionName: $_BITBUCKET_SECRET_VERSION
+    env: 'BITBUCKET_SSH_KEY'
+  - versionName: projects/${PROJECT_ID}/secrets/cloudbuild-bitbucket-cloud-1727187261623-read-api-token/versions/latest
+    env: 'READ_ACCESS_TOKEN'
+
+timeout: 3600s
+
+options:
+  pool:
+    name: projects/$PROJECT_ID/locations/us-central1/workerPools/E2-HIGHCPU-8
